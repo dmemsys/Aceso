@@ -1,0 +1,5 @@
+{
+    "methods": ["aceso", "fusee"],
+    "workload_names": {"STORAGE": "workloadtwis", "COMPUTE": "workloadtwic", "TRANSIENT": "workloadtwit"},
+    "MN_num": 5
+}

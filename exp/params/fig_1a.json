@@ -1,0 +1,5 @@
+{
+    "methods": ["fusee"],
+    "MN_num": 5,
+    "index_replicas": [3, 2, 1]
+}

@@ -1,0 +1,20 @@
+{
+    "methods": ["aceso", "fusee"],
+    "workload_names": {"YCSB A": "workloada"},
+    "target_epoch": {"YCSB A": 1, "YCSB B": 1, "YCSB C": 1, "YCSB D": 1},
+    "client_num":  {
+        "fusee": {
+            "YCSB A"   : [[1, 1], [1, 2], [1, 4], [1, 8], [2, 8], [4, 8], [8, 8]]
+        },
+        "clover": {
+            "YCSB A"   : [[1, 1], [1, 2], [1, 4], [1, 8], [2, 8], [4, 8], [8, 8]]
+        }
+    },
+    "MN_num": 5,
+    "workload_ops" : {
+        "YCSB A" : ["search", "update"],
+        "YCSB B" : ["search", "update"],
+        "YCSB C" : ["search"],
+        "YCSB D" : ["search", "insert"]
+    }
+}

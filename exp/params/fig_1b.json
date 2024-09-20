@@ -1,0 +1,5 @@
+{
+    "methods": ["aceso"],
+    "MN_num": 5,
+    "index_sizes":[64, 128, 256, 512]
+}

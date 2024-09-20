@@ -1,0 +1,15 @@
+{
+    "home_dir" : "/users/hzs/home",
+
+    "server_ips": ["10.10.10.1", "10.10.10.2", "10.10.10.3", "10.10.10.4", "10.10.10.5"],
+    "client_ips": ["10.10.10.6", "10.10.10.7", "10.10.10.8", "10.10.10.9", "10.10.10.10", "10.10.10.11", "10.10.10.12", "10.10.10.13", "10.10.10.14", "10.10.10.15", "10.10.10.16", "10.10.10.17", "10.10.10.18", "10.10.10.19", "10.10.10.20"],
+    "master_ip": "10.10.10.1",
+
+    "cmake_options": {
+        "aceso"                 : "",
+        "fusee"                 : "",
+        "aceso +slot"           : "-DENABLE_ADDR_CACHE=off -DENABLE_BOTH_CACHE=off -DENABLE_ASYNC_INDEX=off -DENABLE_INVALID_KV=off",
+        "aceso +ckpt"           : "-DENABLE_ADDR_CACHE=off -DENABLE_BOTH_CACHE=off -DENABLE_ASYNC_INDEX=on  -DENABLE_INVALID_KV=off",
+        "aceso +cache"          : "-DENABLE_ADDR_CACHE=on  -DENABLE_BOTH_CACHE=on  -DENABLE_ASYNC_INDEX=on  -DENABLE_INVALID_KV=off"
+    }
+}
