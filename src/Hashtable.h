@@ -75,6 +75,13 @@ typedef struct TagRaceHashRoot {
     RaceHashSubtableEntry subtable_entry[RACE_HASH_MAX_SUBTABLE_NUM][define::replicaIndexNum];
 } RaceHashRoot;
 
+struct __attribute__((__packed__)) RaceHashAtomic {
+    uint64_t fp : 8;
+    uint64_t version : 8;
+    uint64_t server_id : 8;
+    uint64_t offset : 40;
+};
+
 typedef struct TagRaceHashSearchContext {
     int32_t  result;
     int32_t  no_back;
@@ -247,14 +254,6 @@ static inline uint64_t ConvertSlotToUInt64(RaceHashSlot * slot) {
 
 static inline uint64_t ConvertSlotToAddr(RaceHashSlot * slot) {
     return slot->atomic.offset + define::baseAddr;
-}
-
-static inline uint64_t ConvertAddrToOffset(uint64_t remote_addr) {
-    return remote_addr - define::baseAddr;
-}
-
-static inline uint64_t ConvertOffsetToAddr(uint64_t offset) {
-    return offset + define::baseAddr;
 }
 
 uint32_t HashIndexComputeServerId(uint64_t hash, uint32_t num_memory);

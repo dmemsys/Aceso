@@ -99,21 +99,13 @@ Client::~Client() {
     delete network_manager;
 }
 
+// INSERT, UPDATE, DELETE requests share the same procedure
 int Client::kv_insert(KVReqCtx * ctx) {
-    _prepare_request(ctx);
-    _kv_insert_read_buckets(ctx);
-    if (ctx->is_finished) {
-        goto insert_exit;
-    }
-    _kv_insert_write_kv_and_prepare_cas(ctx);
-    if (ctx->is_finished) {
-        goto insert_exit;
-    }
-    _kv_insert_cas_primary(ctx);
+    return kv_update(ctx);
+}
 
-insert_exit:
-    _req_finish(ctx);
-    return ctx->ret_val.ret_code;
+int Client::kv_delete(KVReqCtx * ctx) {
+    return kv_update(ctx);
 }
 
 int Client::kv_update(KVReqCtx * ctx) {
@@ -179,38 +171,6 @@ int Client::kv_update_gc(KVReqCtx * ctx) {
 update_exit:
     _req_finish(ctx);
     ctx->is_sim_gc = false;
-    return ctx->ret_val.ret_code;
-}
-
-int Client::kv_delete(KVReqCtx * ctx) {
-    _prepare_request(ctx);
-
-    if (define::cacheLevel == 2) {
-        _kv_delete_read_cache(ctx);
-        if (ctx->is_finished) {
-            goto delete_exit;
-        }
-    }
-
-    if (ctx->is_curr_kv_hit == false && ctx->is_prev_kv_hit == false) {
-        _kv_delete_read_buckets(ctx);
-        if (ctx->is_finished) {
-            goto delete_exit;
-        }
-        _kv_delete_read_kv_from_buckets(ctx);
-        if (ctx->is_finished) {
-            goto delete_exit;
-        }
-    }
-
-    _kv_delete_write_kv_and_prepare_cas(ctx);
-    if (ctx->is_finished) {
-        goto delete_exit;
-    }
-    _kv_delete_cas_primary(ctx);
-
-delete_exit:
-    _req_finish(ctx);
     return ctx->ret_val.ret_code;
 }
 
@@ -447,7 +407,7 @@ void Client::_fill_write_kv_ror(RdmaOpRegion * ror, KVInfo * a_kv_info, ClientMM
         ror[i].local_addr  = (uint64_t)a_kv_info->l_addr;
         ror[i].remote_addr = r_mm_info->remote_addr[i];
         ror[i].remote_sid  = r_mm_info->server_id[i];
-        if (tail->op == KV_OP_DELETE)
+        if (header->op == KV_OP_DELETE)
             ror[i].size = sizeof(KVLogHeader) + sizeof(KVLogTail) + a_kv_info->key_len;
         else
             ror[i].size = define::subblockSize;
@@ -483,14 +443,6 @@ void Client::_fill_cas_index_ror(RdmaOpRegion * ror, const KVCASAddr * cas_addr)
     }
 }
 
-void Client::_fill_invalid_ror(RdmaOpRegion * ror, const KVRWAddr & invalid_addr, void * local_addr) {
-    ror[0].local_addr = (uint64_t)local_addr;
-    ror[0].remote_addr = invalid_addr.r_kv_addr;
-    ror[0].remote_sid = invalid_addr.server_id;
-    ror[0].size = 1;
-    ror[0].op_code = IBV_WR_RDMA_WRITE;
-}
-
 void Client::_fill_read_index_ror(RdmaOpRegion * ror, const KVCASAddr & cas_addr) {
     ror[0].local_addr = cas_addr.l_kv_addr;
     ror[0].remote_addr = cas_addr.r_kv_addr;
@@ -517,7 +469,7 @@ void Client::_fill_slot(ClientMMAllocCtx * mm_alloc_ctx, KVHashInfo * a_kv_hash_
     new_slot->atomic.offset = ConvertAddrToOffset(mm_alloc_ctx->remote_addr[0]);
     
     new_slot->slot_meta.kv_len = 1;
-    new_slot->slot_meta.epoch = old_slot->slot_meta.epoch;
+    new_slot->slot_meta.epoch = old_slot->slot_meta.epoch;    // TODO: increment meta.epoch after every 256 increments to atomic.version
 }
 
 void Client::_fill_cas_addr(KVReqCtx * ctx, uint64_t * remote_slot_addr, RaceHashSlot * old_slot, RaceHashSlot * new_slot) {
@@ -535,14 +487,8 @@ void Client::_fill_cas_addr(KVReqCtx * ctx, uint64_t * remote_slot_addr, RaceHas
     ctx->new_slot = new_slot;
 
     KVLogHeader * header = (KVLogHeader *)ctx->kv_info->l_addr;
-    header->slot_addr = remote_slot_addr[0];
+    header->slot_offset = ConvertAddrToOffset(remote_slot_addr[0]);
     header->slot_sid = ctx->tbl_addr_info.server_id[0];
-}
-
-void Client::_fill_invalid_addr(KVReqCtx * ctx, RaceHashSlot * local_slot) {
-    ctx->kv_invalid_addr.r_kv_addr = ConvertSlotToAddr(local_slot);
-    ctx->kv_invalid_addr.server_id = local_slot->atomic.server_id;
-    ctx->kv_invalid_addr.length = 1;
 }
 
 void Client::_fill_read_cache_kv_ror(RdmaOpRegion * ror, RaceHashSlot * local_slot_val, uint64_t local_addr) {
@@ -675,6 +621,7 @@ void Client::_prepare_request(KVReqCtx * ctx) {
     ctx->is_curr_kv_hit     = false;
     ctx->has_allocated      = false;
     ctx->has_finished       = false;
+    ctx->has_previous       = false;
     ctx->is_sim_gc          = false;
     ctx->cache_entry        = nullptr;
 
@@ -742,7 +689,7 @@ void Client::_find_empty_slot(KVReqCtx * ctx) {
     ctx->slot_idx   = slot_idx;
 }
 
-int32_t Client::_find_match_kv_idx(KVReqCtx * ctx) {
+int32_t Client::_find_match_slot(KVReqCtx * ctx) {
     int32_t ret = 0;
 
     for (size_t i = 0; i < ctx->kv_read_addr_list.size(); i ++) {
@@ -751,11 +698,66 @@ int32_t Client::_find_match_kv_idx(KVReqCtx * ctx) {
         KVLogHeader * header = (KVLogHeader *)ctx->kv_read_addr_list[i].l_kv_addr;
         if (CheckKey((void *)read_key_addr, header->key_length, (void *)local_key_addr, ctx->kv_info->key_len)) {
             ctx->prev_ver = header->version.val;
+            ctx->match_idx = i;
             return i;
         }
     }
-    
+    ctx->match_idx = -1;
     return -1;
+}
+
+void Client::_prepare_old_slot(KVReqCtx * ctx, uint64_t * remote_slot_addr, RaceHashSlot ** old_slot, RaceHashSlot ** new_slot) {
+    assert(remote_slot_addr != nullptr);
+    assert(old_slot != nullptr);
+    *new_slot = (RaceHashSlot *)ctx->local_cas_target_value_addr;
+    if (!ctx->has_previous) {
+        if (ctx->bucket_idx < 2) {
+            uint64_t local_com_bucket_addr = (uint64_t)ctx->f_com_bucket;
+            uint64_t old_local_slot_addr = (uint64_t)&(ctx->f_com_bucket[ctx->bucket_idx].slots[ctx->slot_idx]);
+            for (int i = 0; i < define::replicaIndexNum; i ++) {
+                remote_slot_addr[i] = ctx->tbl_addr_info.f_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
+            }
+            *old_slot = (RaceHashSlot *)old_local_slot_addr;
+        } else {
+            uint64_t local_com_bucket_addr = (uint64_t)ctx->s_com_bucket;
+            uint64_t old_local_slot_addr = (uint64_t)&(ctx->s_com_bucket[ctx->bucket_idx - 2].slots[ctx->slot_idx]);
+            for (int i = 0; i < define::replicaIndexNum; i ++) {
+                remote_slot_addr[i] = ctx->tbl_addr_info.s_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
+            }
+            *old_slot = (RaceHashSlot *)old_local_slot_addr;
+        } 
+    } else {
+        if (ctx->is_prev_kv_hit) {
+            for (int i = 0; i < define::replicaIndexNum; i ++) {
+                remote_slot_addr[i] = ctx->cache_entry->r_slot_addr;
+            }
+            *old_slot = &ctx->cache_slot;
+        } else if (ctx->is_curr_kv_hit) {
+            for (int i = 0; i < define::replicaIndexNum; i ++) {
+                remote_slot_addr[i] = ctx->cache_entry->r_slot_addr;
+            }
+            *old_slot = (RaceHashSlot *)ctx->local_slot_addr;
+        } else {
+            std::pair<int32_t, int32_t> idx_pair = ctx->kv_idx_list[ctx->match_idx];
+            int32_t bucket_idx = idx_pair.first;
+            int32_t slot_idx   = idx_pair.second;
+            if (bucket_idx < 2) {
+                uint64_t local_com_bucket_addr = (uint64_t)ctx->f_com_bucket;
+                uint64_t old_local_slot_addr   = (uint64_t)&(ctx->f_com_bucket[bucket_idx].slots[slot_idx]);
+                for (int i = 0; i < define::replicaIndexNum; i ++) {
+                    remote_slot_addr[i] = ctx->tbl_addr_info.f_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
+                }
+                *old_slot = (RaceHashSlot *)old_local_slot_addr;
+            } else {
+                uint64_t local_com_bucket_addr = (uint64_t)ctx->s_com_bucket;
+                uint64_t old_local_slot_addr   = (uint64_t)&(ctx->s_com_bucket[bucket_idx - 2].slots[slot_idx]);
+                for (int i = 0; i < define::replicaIndexNum; i ++) {
+                    remote_slot_addr[i] = ctx->tbl_addr_info.s_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
+                }
+                *old_slot = (RaceHashSlot *)old_local_slot_addr;
+            }
+        }
+    }
 }
 
 void Client::_get_local_bucket_info(KVReqCtx * ctx) {
@@ -778,7 +780,7 @@ void Client::_get_local_bucket_info(KVReqCtx * ctx) {
     assert(ctx->s_com_bucket->local_depth == ctx->hash_info.local_depth);
 }
 
-void Client::_prepare_ver_addrs(KVReqCtx * ctx) {
+void Client::_prepare_ver_addr(KVReqCtx * ctx) {
     KVLogHeader * header = (KVLogHeader *)ctx->kv_info->l_addr;
     uint32_t tail_offset = offsetof(KVLogHeader, version); 
     ctx->kv_ver_addr_list.clear();
@@ -808,7 +810,7 @@ CoroContext * Client::_get_coro_ctx(KVReqCtx * ctx) {
 }
 
 int Client::_write_new_block_meta(CoroContext *ctx, MMBlockRegInfo * reg_info) {
-    RdmaOpRegion * ror_list = new RdmaOpRegion[define::memoryNodeNum];
+    RdmaOpRegion ror_list[define::memoryNodeNum];
     MMBlockMeta prim_meta;
     prim_meta.block_role = DATA_BLOCK;
     prim_meta.is_broken = 0;
@@ -825,7 +827,7 @@ int Client::_write_new_block_meta(CoroContext *ctx, MMBlockRegInfo * reg_info) {
 }
 
 int Client::_write_seal_block_meta(CoroContext *ctx, uint64_t block_addr, uint32_t server_id, uint64_t index_ver) {
-    RdmaOpRegion * ror_list = new RdmaOpRegion[define::memoryNodeNum];
+    RdmaOpRegion ror_list[define::memoryNodeNum];
     MMBlockMeta prim_meta;
     prim_meta.block_role = DATA_BLOCK;
     prim_meta.is_broken = 0;
@@ -893,6 +895,9 @@ struct KVMsg * Client::_get_new_request(KVReqCtx * ctx) {
 void Client::_req_finish(KVReqCtx * ctx) {
     assert(ctx->is_finished == true);
 
+    if (ctx->req_type == KV_OP_SEARCH && ctx->ret_val.value_addr != NULL && ctx->read_header->op == KV_OP_DELETE)
+        ctx->ret_val.value_addr = NULL;
+
     if (ctx->has_allocated == false)
         return;
     if (ctx->has_finished == true)
@@ -913,32 +918,29 @@ void Client::_req_finish(KVReqCtx * ctx) {
 
 void Client::_alloc_new_kv(KVReqCtx * ctx) {
     int ret = 0;
-    KVLogHeader * header = (KVLogHeader *)ctx->kv_info->l_addr;
+    KVLogHeader * head = (KVLogHeader *)ctx->kv_info->l_addr;
     if (ctx->req_type == KV_OP_DELETE)
-        header->value_length = 0;
-    KVLogTail * tail = (KVLogTail *)((uint64_t)ctx->kv_info->l_addr + sizeof(KVLogHeader) + header->key_length + header->value_length);
-    tail->op = ctx->req_type;
-    header->is_valid = true;
-    header->version.val = ctx->prev_ver + 1;
+        head->value_length = 0;
+    KVLogTail * tail = (KVLogTail *)((uint64_t)ctx->kv_info->l_addr + sizeof(KVLogHeader) + head->key_length + head->value_length);
+    head->op = ctx->req_type;
+    head->write_version = 1; // 2-bit: 01
+    tail->write_version = 1;
+    head->version.val = ctx->prev_ver + 1;
 
     // allocate remote memory
-    uint32_t kv_block_size = header->key_length + header->value_length + sizeof(KVLogHeader) + sizeof(KVLogTail);
+    uint32_t kv_block_size = head->key_length + head->value_length + sizeof(KVLogHeader) + sizeof(KVLogTail);
     _mm_alloc(ctx, kv_block_size, &ctx->mm_alloc_ctx);
     return;
 }
 
 void Client::_write_new_kv(KVReqCtx * ctx) {
     // prepare version write addr
-    _prepare_ver_addrs(ctx);
+    _prepare_ver_addr(ctx);
 
     // generate send requests
-    int k = define::replicaNum;
-    RdmaOpRegion * ror_list = new RdmaOpRegion[define::replicaNum];
+    RdmaOpRegion ror_list[define::replicaNum];
     _fill_write_kv_ror(ror_list, ctx->kv_info, &ctx->mm_alloc_ctx);
-
-    network_manager->rdma_write_batches_sync(ror_list, k, ctx->coro_ctx);
-
-    delete[] ror_list;
+    network_manager->rdma_write_batches_sync(ror_list, define::replicaNum, ctx->coro_ctx);
     ctx->is_finished = false;
     return;
 }
@@ -946,21 +948,9 @@ void Client::_write_new_kv(KVReqCtx * ctx) {
 void Client::_modify_primary_idx(KVReqCtx * ctx) {
     int ret = 0;
     // update primary index
-    RdmaOpRegion * ror_list = new RdmaOpRegion[define::replicaIndexNum + 1]; assert(ror_list != nullptr);
-    int k = define::replicaIndexNum; 
+    RdmaOpRegion ror_list[define::replicaIndexNum];
     _fill_cas_index_ror(ror_list, ctx->kv_modify_pr_cas_addr);
-
-#ifdef ENABLE_INVALID_KV
-    if ((ctx->req_type == KV_OP_UPDATE || ctx->req_type == KV_OP_DELETE)) {
-        uint8_t is_valid = false;
-        _fill_invalid_ror(&ror_list[define::replicaIndexNum], ctx->kv_invalid_addr, &is_valid);
-        k += 1;
-    }
-#endif
-
-    network_manager->rdma_mix_batches_sync(ror_list, k, ctx->coro_ctx);
-
-    delete[] ror_list;
+    network_manager->rdma_mix_batches_sync(ror_list, define::replicaIndexNum, ctx->coro_ctx);
 
     // cas primary failed
     if (*(uint64_t *)ctx->kv_modify_pr_cas_addr[0].l_kv_addr != ctx->kv_modify_pr_cas_addr[0].orig_value) {
@@ -976,27 +966,22 @@ void Client::_modify_primary_idx(KVReqCtx * ctx) {
         }
         // write failed version number
         uint64_t ver_num = define::invalidVersion;
-        RdmaOpRegion * ror_list = new RdmaOpRegion[define::replicaNum]; assert(ror_list != nullptr);
-        int k = define::replicaNum; 
+        RdmaOpRegion ror_list[define::replicaNum];
         _fill_write_ver_ror(ror_list, ctx->kv_ver_addr_list, &ver_num, sizeof(uint64_t));
-        network_manager->rdma_write_batches_sync(ror_list, k, ctx->coro_ctx);
-        delete[] ror_list;
-
+        network_manager->rdma_write_batches_sync(ror_list, define::replicaNum, ctx->coro_ctx);
         return;
     }
 
     ctx->is_finished = true;
     ctx->ret_val.ret_code = KV_OPS_SUCCESS;
 
-    // if (ctx->req_type == KV_OP_UPDATE || ctx->req_type == KV_OP_DELETE)
-    //     mm_->mm_free(ctx->kv_modify_pr_cas_list[0].orig_value);
+    if (ctx->has_previous)
+        _mm_free(ctx->kv_modify_pr_cas_addr[0].orig_value);
 
-    if (define::cacheLevel >= 1 && ctx->req_type != KV_OP_DELETE) {
+    if (define::cacheLevel >= 1) {
         uint64_t r_slot_addr = ctx->kv_modify_pr_cas_addr[0].r_kv_addr;
         uint64_t local_cas_val = ctx->kv_modify_pr_cas_addr[0].swap_value;
         addr_cache->cache_update(ctx->key_str, ctx->tbl_addr_info.server_id[0], ctx->new_slot, r_slot_addr);
-    } else if (define::cacheLevel >= 1 && ctx->req_type == KV_OP_DELETE) {
-        addr_cache->cache_delete(ctx->key_str);
     }
 
     return;
@@ -1020,6 +1005,22 @@ void Client::_mm_free_cur(const ClientMMAllocCtx * ctx) {
         last_last_allocated.local_mmblock_addr = ctx->prev_mmblock_addr;
     }
     last_allocated_info = last_last_allocated;
+}
+
+void Client::_mm_free(uint64_t old_slot) {
+    RaceHashAtomic slot = *(RaceHashAtomic *)&old_slot;
+    uint64_t kv_addr = ConvertOffsetToAddr(slot.offset);
+    uint32_t subblock_id = (kv_addr % define::memoryBlockSize) / define::subblockSize;
+    uint64_t block_addr = kv_addr - (kv_addr % define::memoryBlockSize);
+    uint32_t subblock_8byte_offset = subblock_id / 64;
+    
+    uint64_t bmap_addr = block_addr + subblock_8byte_offset * sizeof(uint64_t);
+    uint64_t add_value = 1 << (subblock_id % 64);
+
+    char tmp[256] = {0};
+    sprintf(tmp, "%lu@%d", bmap_addr, slot.server_id);
+    std::string addr_str(tmp);
+    free_bit_map[addr_str] += add_value;
 }
 
 void Client::_mm_alloc(KVReqCtx * ctx, size_t size, __OUT ClientMMAllocCtx * mm_ctx) {
@@ -1142,16 +1143,16 @@ int Client::_dyn_reg_new_block(KVReqCtx * ctx, MMBlockRegInfo * reg_info, int al
 void Client::_kv_search_read_cache(KVReqCtx * ctx) {
     _cache_read_prev_kv(ctx);
     if (ctx->is_prev_kv_hit) {
-        KVLogHeader * cached_header = (KVLogHeader *)ctx->local_cache_addr;
-        ctx->ret_val.value_addr = (void *)((uint64_t)cached_header + sizeof(KVLogHeader) + cached_header->key_length);
+        ctx->read_header = (KVLogHeader *)ctx->local_cache_addr;
+        ctx->ret_val.value_addr = (void *)((uint64_t)ctx->read_header + sizeof(KVLogHeader) + ctx->read_header->key_length);
         ctx->is_finished = true;
         return;
     }
     _cache_read_curr_kv(ctx);
     if (ctx->is_curr_kv_hit) {
         uint64_t read_key_addr = (uint64_t)ctx->local_kv_addr + sizeof(KVLogHeader);
-        KVLogHeader * header = (KVLogHeader *)ctx->local_kv_addr;
-        ctx->ret_val.value_addr = (void *)(read_key_addr + header->key_length);
+        ctx->read_header = (KVLogHeader *)ctx->local_kv_addr;
+        ctx->ret_val.value_addr = (void *)(read_key_addr + ctx->read_header->key_length);
         ctx->is_finished = true;
         return;
     }
@@ -1208,15 +1209,15 @@ void Client::_kv_search_read_kv_from_buckets(KVReqCtx * ctx) {
     }
 
     if ((define::cacheLevel == 1) && ctx->cache_entry && ctx->cache_read_kv) {
-        KVLogHeader * cached_header = (KVLogHeader *)ctx->local_cache_addr;
+        ctx->read_header = (KVLogHeader *)ctx->local_cache_addr;
         if (_cache_entry_is_valid(ctx)) {
             uint64_t read_key_addr = (uint64_t)ctx->local_cache_addr + sizeof(KVLogHeader);
             uint64_t local_key_addr = (uint64_t)ctx->kv_info->l_addr + sizeof(KVLogHeader);
-            if (CheckKey((void *)read_key_addr, cached_header->key_length, (void *)local_key_addr, ctx->kv_info->key_len)) {
+            if (CheckKey((void *)read_key_addr, ctx->read_header->key_length, (void *)local_key_addr, ctx->kv_info->key_len)) {
                 cache_hit_num++;
                 ctx->cache_entry->acc_cnt++; // update cache counter
                 ctx->is_prev_kv_hit = true;
-                ctx->ret_val.value_addr = (void *)((uint64_t)cached_header + sizeof(KVLogHeader) + cached_header->key_length);
+                ctx->ret_val.value_addr = (void *)((uint64_t)ctx->read_header + sizeof(KVLogHeader) + ctx->read_header->key_length);
                 ctx->is_finished = true;
                 return;
             }
@@ -1284,10 +1285,10 @@ void Client::_kv_search_check_kv_from_buckets(KVReqCtx * ctx) {
         return;
     }
     
-    int32_t match_idx = _find_match_kv_idx(ctx);
+    int32_t match_idx = _find_match_slot(ctx);
     if (match_idx != -1) {
         uint64_t read_key_addr = ctx->kv_read_addr_list[match_idx].l_kv_addr + sizeof(KVLogHeader);
-        KVLogHeader * header = (KVLogHeader *)ctx->kv_read_addr_list[match_idx].l_kv_addr;
+        ctx->read_header = (KVLogHeader *)ctx->kv_read_addr_list[match_idx].l_kv_addr;
         
         int bucket_id = ctx->kv_idx_list[match_idx].first;
         int slot_id   = ctx->kv_idx_list[match_idx].second;
@@ -1304,7 +1305,7 @@ void Client::_kv_search_check_kv_from_buckets(KVReqCtx * ctx) {
             remote_slot_addr = ctx->tbl_addr_info.s_bucket_addr[0] + (old_local_slot_addr - local_com_bucket_addr);
         }
 
-        ctx->ret_val.value_addr = (void *)(read_key_addr + header->key_length);
+        ctx->ret_val.value_addr = (void *)(read_key_addr + ctx->read_header->key_length);
         ctx->is_finished = true;
 
         if (define::cacheLevel >= 1) {
@@ -1337,9 +1338,8 @@ void Client::_kv_search_check_kv_degrade(KVReqCtx * ctx) {
     int32_t match_idx = _find_match_kv_idx_degrade(ctx);
     if (match_idx != -1) {
         uint64_t read_key_addr = ctx->kv_recover_addr_list[match_idx].l_kv_addr + sizeof(KVLogHeader);
-        KVLogHeader * header = (KVLogHeader *)ctx->kv_recover_addr_list[match_idx].l_kv_addr;
-        
-        ctx->ret_val.value_addr = (void *)(read_key_addr + header->key_length);
+        ctx->read_header = (KVLogHeader *)ctx->kv_recover_addr_list[match_idx].l_kv_addr;
+        ctx->ret_val.value_addr = (void *)(read_key_addr + ctx->read_header->key_length);
         ctx->is_finished = true;
         return;
     } else {
@@ -1352,80 +1352,6 @@ void Client::_kv_search_check_kv_degrade(KVReqCtx * ctx) {
         ctx->is_finished = true;
         return;
     }
-}
-
-void Client::_kv_insert_read_buckets(KVReqCtx * ctx) {
-    int ret = 0;
-    int k = 2;
-    RdmaOpRegion * ror_list = new RdmaOpRegion[2];
-    _fill_read_bucket_ror(ror_list, ctx);
-
-    network_manager->rdma_read_batches_sync(ror_list, k, ctx->coro_ctx);
-    
-    delete[] ror_list;
-    ctx->is_finished = false;
-    return;
-}
-
-void Client::_kv_insert_write_kv_and_prepare_cas(KVReqCtx * ctx) {
-    if (ctx->is_finished) {
-        return;
-    }
-    if (*(ctx->should_stop)) {
-        ctx->is_finished = true;
-        return;
-    }
-
-    int ret = 0;
-    _find_empty_slot(ctx);
-    if (ctx->bucket_idx == -1) {
-        ctx->is_finished = true;
-        ctx->ret_val.ret_code = KV_OPS_FAIL_RETURN;
-        printf("Bucket is full.\n");
-        return;
-    }
-
-    // prepare cas
-    uint64_t remote_slot_addr[define::replicaIndexNum];
-    RaceHashSlot * old_slot = nullptr;
-    RaceHashSlot * new_slot = (RaceHashSlot *)ctx->local_cas_target_value_addr;
-    if (ctx->bucket_idx < 2) {
-        uint64_t local_com_bucket_addr = (uint64_t)ctx->f_com_bucket;
-        uint64_t old_local_slot_addr = (uint64_t)&(ctx->f_com_bucket[ctx->bucket_idx].slots[ctx->slot_idx]);
-        for (int i = 0; i < define::replicaIndexNum; i ++) {
-            remote_slot_addr[i] = ctx->tbl_addr_info.f_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
-        }
-        old_slot = (RaceHashSlot *)old_local_slot_addr;
-    } else {
-        uint64_t local_com_bucket_addr = (uint64_t)ctx->s_com_bucket;
-        uint64_t old_local_slot_addr = (uint64_t)&(ctx->s_com_bucket[ctx->bucket_idx - 2].slots[ctx->slot_idx]);
-        for (int i = 0; i < define::replicaIndexNum; i ++) {
-            remote_slot_addr[i] = ctx->tbl_addr_info.s_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
-        }
-        old_slot = (RaceHashSlot *)old_local_slot_addr;
-    }
-    
-    ctx->req_type = KV_OP_INSERT;
-    ctx->prev_ver = old_slot->atomic.version;
-    _alloc_new_kv(ctx);
-
-    _fill_slot(&ctx->mm_alloc_ctx, &ctx->hash_info, old_slot, new_slot);
-    _fill_cas_addr(ctx, remote_slot_addr, old_slot, new_slot);
-    _fill_invalid_addr(ctx, old_slot);
-
-    _write_new_kv(ctx);
-}
-
-void Client::_kv_insert_cas_primary(KVReqCtx * ctx) {
-    if (ctx->is_finished) {
-        return;
-    }
-    if (*(ctx->should_stop)) {
-        ctx->is_finished = true;
-        return;
-    }
-    _modify_primary_idx(ctx);
-    return;
 }
 
 void Client::_kv_update_read_cache(KVReqCtx * ctx) {
@@ -1446,7 +1372,7 @@ void Client::_kv_update_read_cache(KVReqCtx * ctx) {
 void Client::_kv_update_read_buckets(KVReqCtx * ctx) {
     int ret = 0;
     int k = 2;
-    RdmaOpRegion * ror_list = new RdmaOpRegion[3];
+    RdmaOpRegion ror_list[3];
     _fill_read_bucket_ror(ror_list, ctx); 
 
     if (define::cacheLevel == 1) {
@@ -1458,8 +1384,6 @@ void Client::_kv_update_read_buckets(KVReqCtx * ctx) {
     }
 
     network_manager->rdma_read_batches_sync(ror_list, k, ctx->coro_ctx);
-
-    delete[] ror_list;
 
     if (*(ctx->should_stop)) {
         ctx->is_finished = true;
@@ -1498,9 +1422,11 @@ void Client::_kv_update_read_kv_from_buckets(KVReqCtx * ctx) {
 
     _find_kv_in_buckets(ctx);
     if (ctx->kv_read_addr_list.size() == 0) {
-        printf("ctx->kv_read_addr_list.size() == 0\n");
-        ctx->ret_val.ret_code = KV_OPS_FAIL_RETURN;
-        ctx->is_finished = true;
+        if (ctx->req_type != KV_OP_INSERT) {
+            printf("ctx->kv_read_addr_list.size() == 0\n");
+            ctx->ret_val.ret_code = KV_OPS_FAIL_RETURN;
+            ctx->is_finished = true;
+        } 
         return;
     }
 
@@ -1526,63 +1452,46 @@ void Client::_kv_update_write_kv_and_prepare_cas(KVReqCtx * ctx) {
 
     // get previous ver
     int32_t match_idx;
-    if (ctx->is_prev_kv_hit) {
-        ;   // do nothing
-    } else if (ctx->is_curr_kv_hit) {
-        ;   // do nothing
+    if (ctx->is_prev_kv_hit || ctx->is_curr_kv_hit) {
+        ctx->has_previous = true;
     } else {
-        match_idx = _find_match_kv_idx(ctx);
+        match_idx = _find_match_slot(ctx);
         if (match_idx == -1) {
-            printf("match_idx == -1\n");
-            ctx->is_finished = true;
-            ctx->ret_val.ret_code = KV_OPS_FAIL_RETURN;
-            return;
+            ctx->has_previous = false;
+            if (ctx->req_type != KV_OP_INSERT) {
+                printf("match_idx == -1\n");
+                ctx->is_finished = true;
+                ctx->ret_val.ret_code = KV_OPS_FAIL_RETURN;
+                return;
+            } else {
+                _find_empty_slot(ctx);
+                if (ctx->bucket_idx == -1) {
+                    printf("bucket is full\n");
+                    ctx->is_finished = true;
+                    ctx->ret_val.ret_code = KV_OPS_FAIL_RETURN;
+                    return;
+                }
+            }
+        } else {
+            ctx->has_previous = true;
         }
+    }
+
+    if (ctx->req_type == KV_OP_INSERT) {
+        assert(ctx->has_previous == false);  // [DEBUG] currently doesn't test INSERT after DELETE
     }
 
     // prepare cas
     uint64_t remote_slot_addr[define::replicaIndexNum];
-    RaceHashSlot   cache_slot;
-    RaceHashSlot * old_slot = nullptr;
-    RaceHashSlot * new_slot = (RaceHashSlot *)ctx->local_cas_target_value_addr;
-    if (ctx->is_prev_kv_hit) {
-        cache_slot = ctx->cache_slot;
-        for (int i = 0; i < define::replicaIndexNum; i ++) {
-            remote_slot_addr[i] = ctx->cache_entry->r_slot_addr;
-        }
-        old_slot = &cache_slot;
-    } else if (ctx->is_curr_kv_hit) {
-        for (int i = 0; i < define::replicaIndexNum; i ++) {
-            remote_slot_addr[i] = ctx->cache_entry->r_slot_addr;
-        }
-        old_slot = (RaceHashSlot *)ctx->local_slot_addr;
-    } else {
-        std::pair<int32_t, int32_t> idx_pair = ctx->kv_idx_list[match_idx];
-        int32_t bucket_idx = idx_pair.first;
-        int32_t slot_idx   = idx_pair.second;
-        if (bucket_idx < 2) {
-            uint64_t local_com_bucket_addr = (uint64_t)ctx->f_com_bucket;
-            uint64_t old_local_slot_addr   = (uint64_t)&(ctx->f_com_bucket[bucket_idx].slots[slot_idx]);
-            for (int i = 0; i < define::replicaIndexNum; i ++) {
-                remote_slot_addr[i] = ctx->tbl_addr_info.f_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
-            }
-            old_slot = (RaceHashSlot *)old_local_slot_addr;
-        } else {
-            uint64_t local_com_bucket_addr = (uint64_t)ctx->s_com_bucket;
-            uint64_t old_local_slot_addr   = (uint64_t)&(ctx->s_com_bucket[bucket_idx - 2].slots[slot_idx]);
-            for (int i = 0; i < define::replicaIndexNum; i ++) {
-                remote_slot_addr[i] = ctx->tbl_addr_info.s_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
-            }
-            old_slot = (RaceHashSlot *)old_local_slot_addr;
-        }
-    }
-    ctx->req_type = KV_OP_UPDATE;
+    RaceHashSlot * old_slot = nullptr, * new_slot = nullptr;
+    _prepare_old_slot(ctx, remote_slot_addr, &old_slot, &new_slot);
+
+    ctx->req_type = ctx->req_type;
     ctx->prev_ver = old_slot->atomic.version;
     _alloc_new_kv(ctx);
 
     _fill_slot(&ctx->mm_alloc_ctx, &ctx->hash_info, old_slot, new_slot);
     _fill_cas_addr(ctx, remote_slot_addr, old_slot, new_slot);
-    _fill_invalid_addr(ctx, old_slot);
     
     _write_new_kv(ctx);
 }
@@ -1596,177 +1505,6 @@ void Client::_kv_update_cas_primary(KVReqCtx * ctx) {
         return;
     }
 
-    _modify_primary_idx(ctx);
-    return;
-}
-
-void Client::_kv_delete_read_cache(KVReqCtx * ctx) {
-    _cache_read_prev_kv(ctx);
-    if (ctx->is_prev_kv_hit) {
-        KVLogHeader * header = (KVLogHeader *)ctx->local_cache_addr;
-        ctx->prev_ver = header->version.val;
-        return;
-    }
-    _cache_read_curr_kv(ctx);
-    if (ctx->is_curr_kv_hit) {
-        KVLogHeader * header = (KVLogHeader *)ctx->local_kv_addr;
-        ctx->prev_ver = header->version.val;
-        return;
-    }
-}
-
-void Client::_kv_delete_read_buckets(KVReqCtx * ctx) {
-    int ret = 0;
-    int k = 2;
-    RdmaOpRegion * ror_list = new RdmaOpRegion[3];
-    _fill_read_bucket_ror(ror_list, ctx); 
-
-    if (define::cacheLevel == 1) {
-        _cache_search(ctx);
-        if (ctx->cache_entry && ctx->cache_read_kv) {
-            _fill_read_cache_kv_ror(&ror_list[2], (RaceHashSlot *)(&ctx->cache_slot), (uint64_t)ctx->local_cache_addr);
-            k += 1;
-        }
-    }
-
-    network_manager->rdma_read_batches_sync(ror_list, k, ctx->coro_ctx);
-
-    delete[] ror_list;
-
-    if (*(ctx->should_stop)) {
-        ctx->is_finished = true;
-        return;
-    }
-
-    ctx->is_finished = false;
-    return;
-}
-
-void Client::_kv_delete_read_kv_from_buckets(KVReqCtx * ctx) {
-    int ret = 0;
-    if(ctx->is_finished) {
-        return;
-    }
-    if (*(ctx->should_stop)) {
-        ctx->is_finished = true;
-        return;
-    }
-    if ((define::cacheLevel == 1) && ctx->cache_entry && ctx->cache_read_kv) {
-        KVLogHeader * cached_header = (KVLogHeader *)ctx->local_cache_addr;
-        if (_cache_entry_is_valid(ctx)) {
-            uint64_t read_key_addr = (uint64_t)ctx->local_cache_addr + sizeof(KVLogHeader);
-            uint64_t local_key_addr = (uint64_t)ctx->kv_info->l_addr + sizeof(KVLogHeader);
-            if (CheckKey((void *)read_key_addr, cached_header->key_length, (void *)local_key_addr, ctx->kv_info->key_len)) {
-                cache_hit_num++;
-                ctx->cache_entry->acc_cnt++; // update cache counter
-                ctx->is_prev_kv_hit = true;
-                ctx->prev_ver = cached_header->version.val;
-                return;
-            }
-        }
-        cache_mis_num++;
-        ctx->cache_entry->miss_cnt++;
-    }
-    
-    _find_kv_in_buckets(ctx);
-    if (ctx->kv_read_addr_list.size() == 0) {
-        ctx->ret_val.ret_code = KV_OPS_FAIL_RETURN;
-        ctx->is_finished = true;
-        return;
-    }
-
-    int k = ctx->kv_read_addr_list.size();
-    RdmaOpRegion * ror_list = new RdmaOpRegion[k];
-    _fill_read_kv_ror(ror_list, ctx->kv_read_addr_list);
-    network_manager->rdma_read_batches_sync(ror_list, k, ctx->coro_ctx);
-    
-    delete[] ror_list;
-    ctx->is_finished = false;
-
-    return;
-}
-
-void Client::_kv_delete_write_kv_and_prepare_cas(KVReqCtx * ctx) {
-    if (ctx->is_finished) {
-        return;
-    }
-    if (*(ctx->should_stop)) {
-        ctx->is_finished = true;
-        return;
-    }
-
-    // get previous ver
-    int32_t match_idx;
-    if (ctx->is_prev_kv_hit) {
-        ;   // do nothing
-    } else if (ctx->is_curr_kv_hit) {
-        ;   // do nothing
-    } else {
-        match_idx = _find_match_kv_idx(ctx);
-        if (match_idx == -1) {
-            ctx->is_finished = true;
-            ctx->ret_val.ret_code = KV_OPS_SUCCESS;
-            return;
-        }
-    }
-
-    // prepare cas
-    uint64_t remote_slot_addr[define::replicaIndexNum];
-    RaceHashSlot   cache_slot;
-    RaceHashSlot * old_slot = nullptr;
-    RaceHashSlot * new_slot = (RaceHashSlot *)ctx->local_cas_target_value_addr;
-    memset(new_slot, 0, sizeof(RaceHashSlot));
-    if (ctx->is_prev_kv_hit) {
-        cache_slot = ctx->cache_slot;
-        for (int i = 0; i < define::replicaIndexNum; i ++) {
-            remote_slot_addr[i] = ctx->cache_entry->r_slot_addr;
-        }
-        old_slot = &cache_slot;
-    } else if (ctx->is_curr_kv_hit) {
-        for (int i = 0; i < define::replicaIndexNum; i ++) {
-            remote_slot_addr[i] = ctx->cache_entry->r_slot_addr;
-        }
-        old_slot = (RaceHashSlot *)ctx->local_slot_addr;
-    } else {
-        std::pair<int32_t, int32_t> idx_pair = ctx->kv_idx_list[match_idx];
-        int32_t bucket_idx = idx_pair.first;
-        int32_t slot_idx   = idx_pair.second;
-        if (bucket_idx < 2) {
-            uint64_t local_com_bucket_addr = (uint64_t)ctx->f_com_bucket;
-            uint64_t old_local_slot_addr   = (uint64_t)&(ctx->f_com_bucket[bucket_idx].slots[slot_idx]);
-            for (int i = 0; i < define::replicaIndexNum; i ++) {
-                remote_slot_addr[i] = ctx->tbl_addr_info.f_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
-            }
-            old_slot = (RaceHashSlot *)old_local_slot_addr;
-        } else {
-            uint64_t local_com_bucket_addr = (uint64_t)ctx->s_com_bucket;
-            uint64_t old_local_slot_addr   = (uint64_t)&(ctx->s_com_bucket[bucket_idx - 2].slots[slot_idx]);
-            for (int i = 0; i < define::replicaIndexNum; i ++) {
-                remote_slot_addr[i] = ctx->tbl_addr_info.s_bucket_addr[i] + (old_local_slot_addr - local_com_bucket_addr);
-            }
-            old_slot = (RaceHashSlot *)old_local_slot_addr;
-        }
-    }
-    ctx->req_type = KV_OP_DELETE;
-    ctx->prev_ver = old_slot->atomic.version;
-    _alloc_new_kv(ctx);
-
-    new_slot->atomic.version = (old_slot->atomic.version + 1) % define::versionRound;
-    new_slot->slot_meta.epoch = old_slot->slot_meta.epoch;
-    _fill_cas_addr(ctx, remote_slot_addr, old_slot, new_slot);
-    _fill_invalid_addr(ctx, old_slot);
-    
-    _write_new_kv(ctx);
-}
-
-void Client::_kv_delete_cas_primary(KVReqCtx * ctx) {
-    if(ctx->is_finished) {
-        return;
-    }
-    if (*(ctx->should_stop)) {
-        ctx->is_finished = true;
-        return;
-    }
     _modify_primary_idx(ctx);
     return;
 }
@@ -2198,7 +1936,7 @@ int Client::load_kv_requests(uint32_t st_idx, int32_t num_ops, std::string workl
         kv_log_header->value_length = strlen(value_buf);
         memcpy(key_st_addr, key_buf, strlen(key_buf));
         memcpy(value_st_addr, value_buf, strlen(value_buf));
-        kv_log_tail->op = KV_OP_INSERT;
+        kv_log_header->op = KV_OP_INSERT;
 
         // fill kv info
         kv_info_list[idx].key_len = strlen(key_buf);
@@ -2265,6 +2003,7 @@ void Client::run_coroutine(volatile bool *should_stop, WorkFunc work_func, uint3
     for (int i = 0; i < my_coro_num; ++i) {
         worker[i] = CoroCall(std::bind(&Client::coro_worker, this, _1, i, should_stop, work_func));
     }
+    worker[coro_num] = CoroCall(std::bind(&Client::coro_gc, this, _1, coro_num, should_stop));
 
     master = CoroCall(std::bind(&Client::coro_master, this, _1, should_stop));
 
@@ -2351,8 +2090,31 @@ void Client::coro_worker(CoroYield &yield, int coro_id, volatile bool *should_st
     }
 }
 
+void Client::coro_gc(CoroYield &yield, int coro_id, volatile bool *should_stop) {
+    while (!(*should_stop)) {
+        // printf("start free\n");
+        std::unordered_map<std::string, uint64_t> gc_map(this->free_bit_map);
+        this->free_bit_map.clear();
+        for (auto it = gc_map.begin(); it != gc_map.end(); it++) {
+            // TODO: use 2-sided RPC + 1-sided WRITE to batch free stale KVs, first WRITE the bitmaps to a pre-allocated region, then notify the server to process
+        }
+
+        auto last_time = std::chrono::high_resolution_clock::now();
+        busy_waiting_queue.push(std::make_pair(coro_id, [&last_time](){
+            auto curr_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::seconds>(curr_time - last_time);
+            if (duration.count() >= 10) {    // GC every 10 seconds
+                last_time = curr_time;
+                return true;
+            }
+            return false;
+        }));
+        yield(master);
+    }
+}
+
 void Client::coro_master(CoroYield &yield, volatile bool *should_stop) {
-    for (int i = 0; i < my_coro_num; ++i) {
+    for (int i = 0; i < my_coro_num + 1; ++i) {
         yield(worker[i]);
     }
     std::deque<uint64_t> wait_coros;

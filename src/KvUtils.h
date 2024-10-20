@@ -180,7 +180,8 @@ struct __attribute__((__packed__)) KVLogVersion {
 };
 
 struct __attribute__((__packed__)) KVLogHeader {
-    uint8_t  is_valid;     
+    uint8_t  write_version;    // write version (head)
+    uint8_t  op;    
     uint16_t key_length;
     uint32_t value_length;
 
@@ -189,13 +190,12 @@ struct __attribute__((__packed__)) KVLogHeader {
         uint64_t val;
     } version;
 
-    uint32_t slot_sid;
-    uint64_t slot_addr;
+    uint64_t slot_sid : 16;
+    uint64_t slot_offset : 48;
 };
 
 struct KVLogTail {
-    uint8_t  crc;
-    uint8_t  op;
+    uint8_t  write_version;    // write version (tail)
 };
 
 typedef struct TagClientLogMetaInfo {
@@ -234,15 +234,24 @@ static inline uint64_t roundup_256(uint64_t len) {
     return (len / 256 + 1) * 256;
 }
 
+static inline uint64_t ConvertAddrToOffset(uint64_t remote_addr) {
+    return remote_addr - define::baseAddr;
+}
+
+static inline uint64_t ConvertOffsetToAddr(uint64_t offset) {
+    return offset + define::baseAddr;
+}
+
 static inline bool header_is_valid(KVLogHeader * head) {
     bool is_valid = true;
-    if (head->is_valid == false) {
+    uint64_t slot_addr = ConvertOffsetToAddr(head->slot_offset);
+    if (head->write_version == 0) { // TODO: check tail write_version
         is_valid = false;
     }
     else if (head->key_length == 0 || head->value_length == 0) {
         is_valid = false;
     }
-    else if (head->slot_addr <= define::baseAddr || head->slot_addr > (define::baseAddr + HASH_AREA_BORDER)) {
+    else if (slot_addr <= define::baseAddr || slot_addr > (define::baseAddr + HASH_AREA_BORDER)) {
         printf("should not happen\n");
         is_valid = false;
     } 
@@ -255,14 +264,6 @@ static inline bool header_is_valid(KVLogHeader * head) {
     }
     
     return is_valid;
-}
-
-static inline bool log_is_valid(KVLogHeader * head) {
-    return head->is_valid == true;
-}
-
-static inline bool log_is_insert(KVLogTail * tail) {
-    return tail->op == KV_OP_INSERT;
 }
 
 static inline uint64_t time_spent_us(struct timeval * st, struct timeval * et) {

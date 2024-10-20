@@ -773,7 +773,7 @@ inline RaceHashSlot * Server::_recover_locate_slot(uint64_t l_kv_addr, uint64_t 
     for (int i = 0; i < 4; i ++) {
         for (int j = 0; j < RACE_HASH_ASSOC_NUM; j ++) {
             if (slot_arr[i][j].atomic.fp == hash_fp && slot_arr[i][j].atomic.offset != 0) {                
-                if (header->slot_addr == (uint64_t)&slot_arr[i][j]) {
+                if (ConvertOffsetToAddr(header->slot_offset) == (uint64_t)&slot_arr[i][j]) {
                     return &slot_arr[i][j];
                 } else {
                     KVRecoverAddr cur_kv_addr;
@@ -1624,7 +1624,7 @@ void * Server::thread_main() {
     time_t last_ckpt_time = time(NULL);
     ibv_wc wc;
     while (!need_stop) {
-#ifdef ENABLE_RPC_BLOCK
+#ifdef ENABLE_RPC_BLOCK // Whether RPC is blocking or non-blocking has a negligible impact on performance.
         rc = network_manager->poll_cq_once_block(&wc, network_manager->get_rpc_recv_cq());
         if (rc <= 0)
             continue;

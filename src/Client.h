@@ -131,6 +131,7 @@ typedef struct TagKVReqCtx {
     // for insert
     int32_t bucket_idx; // bucket_idx:0~3，slot_idx:0~6
     int32_t slot_idx;
+    int32_t match_idx;
 
     // for kv update/delete
     KVRWAddr kv_invalid_addr;
@@ -139,8 +140,10 @@ typedef struct TagKVReqCtx {
     bool has_allocated;
     bool has_finished;
     bool is_sim_gc;                // whether to simulate GC
+    bool has_previous;
 
     ReturnValue ret_val;
+    KVLogHeader * read_header;
 
     volatile bool * should_stop;
 
@@ -178,7 +181,7 @@ public:
     uint64_t     raw_valid_kv_sz;
 
 private:
-    CoroCall worker[define::maxCoroNum];
+    CoroCall worker[define::maxCoroNum + 1];    // +1 for GC
     CoroCall master;
     CoroQueue busy_waiting_queue;
     uint32_t lock_coro_id;
@@ -215,6 +218,8 @@ private:
     std::unordered_map<uint64_t, std::vector<uint64_t> > parity_slab_map;
     std::unordered_map<uint64_t, std::vector<uint64_t> > primar_slab_map;
 
+    // for free
+    std::unordered_map<std::string, uint64_t> free_bit_map;
     // for degraded search
     void * degrade_buf;
     void * sim_gc_buf;
@@ -245,9 +250,6 @@ private:
         assert(ret == 0);
         return 0;
     }
-    inline bool _log_is_valid(KVLogHeader * head) {
-        return head->is_valid == true;
-    }
 
 // private methods
 private:
@@ -261,6 +263,7 @@ private:
     void _convert_offset_to_addr(uint64_t *addr, uint64_t offset, uint64_t local_offset);
     void _mm_alloc(KVReqCtx * ctx, size_t size, __OUT ClientMMAllocCtx * mm_ctx);
     void _mm_free_cur(const ClientMMAllocCtx * ctx);
+    void _mm_free(uint64_t old_slot);
     void _alloc_memory_block(KVReqCtx * ctx, std::deque<SubblockInfo> &free_queue);
     void _alloc_subtable(KVReqCtx * ctx, __OUT ClientMMAllocSubtableCtx * mm_ctx);
     int _start_ckpt(void);
@@ -276,22 +279,21 @@ private:
     uint32_t _get_index_in_xor_map(uint64_t pr_addr);
     CoroContext * _get_coro_ctx(KVReqCtx * ctx);
     
-
     void _prepare_request(KVReqCtx * ctx);
     void _cache_search(KVReqCtx * ctx);
     void _get_kv_hash_info(KVInfo * kv_info, __OUT KVHashInfo * kv_hash_info);
     void _get_kv_addr_info(KVHashInfo * kv_hash_info, __OUT KVTableAddrInfo * kv_addr_info);
     void _find_kv_in_buckets(KVReqCtx * ctx);
     void _get_local_bucket_info(KVReqCtx * ctx);
-    int32_t _find_match_kv_idx(KVReqCtx * ctx);
+    int32_t _find_match_slot(KVReqCtx * ctx);
     void _find_empty_slot(KVReqCtx * ctx);
     void _alloc_new_kv(KVReqCtx * ctx);
     void _write_new_kv(KVReqCtx * ctx);
-    void _prepare_ver_addrs(KVReqCtx * ctx);
+    void _prepare_ver_addr(KVReqCtx * ctx);
+    void _prepare_old_slot(KVReqCtx * ctx, uint64_t * remote_slot_addr, RaceHashSlot ** old_slot, RaceHashSlot ** new_slot);
     void _req_finish(KVReqCtx * ctx);
     void _fill_slot(ClientMMAllocCtx * mm_alloc_ctx, KVHashInfo * a_kv_hash_info, RaceHashSlot * old_slot, __OUT RaceHashSlot * new_slot);
     void _fill_cas_addr(KVReqCtx * ctx, uint64_t * remote_slot_addr, RaceHashSlot * old_slot, RaceHashSlot * new_slot);
-    void _fill_invalid_addr(KVReqCtx * ctx, RaceHashSlot * local_slot);
     void _modify_primary_idx(KVReqCtx * ctx);
     bool _cache_entry_is_valid(KVReqCtx * ctx);
     bool _need_degrade_search(uint64_t remote_addr, uint32_t server_id);
@@ -315,28 +317,19 @@ private:
     void _fill_read_kv_ror(RdmaOpRegion * ror, const std::vector<KVRWAddr> & r_addr_list);
     void _fill_write_kv_ror(RdmaOpRegion * ror, KVInfo * a_kv_info, ClientMMAllocCtx * r_mm_info);
     void _fill_cas_index_ror(RdmaOpRegion * ror, const KVCASAddr * cas_addr);
-    void _fill_invalid_ror(RdmaOpRegion * ror, const KVRWAddr & invalid_addr, void * local_addr);
     void _fill_write_ver_ror(RdmaOpRegion * ror, std::vector<KVRWAddr> & ver_addr_list, void * local_addr, uint32_t length);
     void _fill_read_index_ror(RdmaOpRegion * ror, const KVCASAddr & cas_addr);
     void _fill_recover_kv_ror(RdmaOpRegion * ror, const std::vector<KVRecoverAddr> & r_addr_list);
-    // void _fill_write_meta_ror(RdmaOpRegion * ror, const std::vector<KVRWAddr> & r_addr_list);
+
     void _kv_search_read_cache(KVReqCtx * ctx);
     void _kv_search_read_buckets(KVReqCtx * ctx);
     void _kv_search_read_kv_from_buckets(KVReqCtx * ctx);
     void _kv_search_check_kv_from_buckets(KVReqCtx * ctx);
-    void _kv_insert_read_buckets(KVReqCtx * ctx);
-    void _kv_insert_write_kv_and_prepare_cas(KVReqCtx * ctx);
-    void _kv_insert_cas_primary(KVReqCtx * ctx);
     void _kv_update_read_cache(KVReqCtx * ctx);
     void _kv_update_read_buckets(KVReqCtx * ctx);
     void _kv_update_read_kv_from_buckets(KVReqCtx * ctx);
     void _kv_update_write_kv_and_prepare_cas(KVReqCtx * ctx);
     void _kv_update_cas_primary(KVReqCtx * ctx);
-    void _kv_delete_read_cache(KVReqCtx * ctx);
-    void _kv_delete_read_buckets(KVReqCtx * ctx);
-    void _kv_delete_read_kv_from_buckets(KVReqCtx * ctx);
-    void _kv_delete_write_kv_and_prepare_cas(KVReqCtx * ctx);
-    void _kv_delete_cas_primary(KVReqCtx * ctx);
     // for degraded search
     void _kv_search_read_buckets_degrade(KVReqCtx * ctx);
     void _kv_search_read_kv_degrade(KVReqCtx * ctx);
@@ -351,15 +344,16 @@ public:
     ~Client();
 
     int kv_insert(KVReqCtx * ctx);
+    int kv_delete(KVReqCtx * ctx);
     int kv_update(KVReqCtx * ctx);
     int kv_update_gc(KVReqCtx * ctx);
-    int kv_delete(KVReqCtx * ctx);
     void * kv_search(KVReqCtx * ctx);
     void * kv_search_degrade(KVReqCtx * ctx);
 
     using WorkFunc = std::function<ReturnValue (Client *, KVReqCtx *)>;
     void run_coroutine(volatile bool *should_stop, WorkFunc work_func, uint32_t coro_num);
     void coro_worker(CoroYield &yield, int coro_id, volatile bool *should_stop, WorkFunc work_func);
+    void coro_gc(CoroYield &yield, int coro_id, volatile bool *should_stop);
     void coro_master(CoroYield &yield, volatile bool *should_stop);
 
     // for perf test

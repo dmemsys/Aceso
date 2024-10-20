@@ -8,8 +8,8 @@
     "cmake_options": {
         "aceso"                 : "",
         "fusee"                 : "",
-        "aceso +slot"           : "-DENABLE_ADDR_CACHE=off -DENABLE_BOTH_CACHE=off -DENABLE_ASYNC_INDEX=off -DENABLE_INVALID_KV=off",
-        "aceso +ckpt"           : "-DENABLE_ADDR_CACHE=off -DENABLE_BOTH_CACHE=off -DENABLE_ASYNC_INDEX=on  -DENABLE_INVALID_KV=off",
-        "aceso +cache"          : "-DENABLE_ADDR_CACHE=on  -DENABLE_BOTH_CACHE=on  -DENABLE_ASYNC_INDEX=on  -DENABLE_INVALID_KV=off"
+        "aceso +slot"           : "-DENABLE_ADDR_CACHE=off -DENABLE_BOTH_CACHE=off -DENABLE_ASYNC_INDEX=off",
+        "aceso +ckpt"           : "-DENABLE_ADDR_CACHE=off -DENABLE_BOTH_CACHE=off -DENABLE_ASYNC_INDEX=on",
+        "aceso +cache"          : "-DENABLE_ADDR_CACHE=on  -DENABLE_BOTH_CACHE=on  -DENABLE_ASYNC_INDEX=on"
     }
 }
